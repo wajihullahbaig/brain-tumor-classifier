@@ -5,7 +5,7 @@ Using pytorch's TIMM package to solve a classification problem
 ## Details of training
 * Training and Testing, separate datasets  found at [kaggle](https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset)
 * Using 2 Experts
-* Batch of 32 image
+* Batch of 32 images
 * Some image transformations
 * Advanced training loops
 
