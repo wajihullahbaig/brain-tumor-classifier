@@ -156,8 +156,8 @@ class MoE(nn.Module):
             
             # Auxiliary losses dictionary
             losses = {
-                'balance_loss': balance_loss,
-                'specialization_loss': specialization_loss
+                'balance_loss': balance_loss * 0.6,
+                'specialization_loss': specialization_loss * 0.4
             }
             return output, losses
             
@@ -168,7 +168,7 @@ class MoE(nn.Module):
         
         # Ideal usage should be uniform across all experts
         ideal_usage = torch.ones(num_experts, device=expert_weights.device) / num_experts  # [num_experts]
-                                    
+
         # Get actual expert usage
         expert_usage = expert_weights.mean(0)  # [num_experts]
         
