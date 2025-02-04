@@ -164,31 +164,20 @@ class MoE(nn.Module):
         return output
     
     def calculate_balance_loss(self, expert_weights, labels, num_classes):
-        """Calculate balance loss based on class distribution in batch"""
-        batch_size = labels.size(0)
         num_experts = expert_weights.size(1)
         
-        # Get class distribution in current batch
-        class_counts = torch.bincount(labels, minlength=num_classes)
-        class_distribution = class_counts.float() / batch_size  # [num_classes]
-        
-        # Since we have fewer experts than classes, we need to map/group classes to experts
-        # Simple approach: average pool the class distribution to match number of experts
-        ideal_usage = F.adaptive_avg_pool1d(
-            class_distribution.view(1, 1, -1),  # [1, 1, num_classes]
-            num_experts                         # target length
-        ).squeeze()  # [num_experts]
-        
+        # Ideal usage should be uniform across all experts
+        ideal_usage = torch.ones(num_experts, device=expert_weights.device) / num_experts  # [num_experts]
+                                    
         # Get actual expert usage
         expert_usage = expert_weights.mean(0)  # [num_experts]
         
-        # Now both are shape [num_experts]
-        balance_loss = F.mse_loss(expert_usage, ideal_usage)
+        # Use KL divergence to measure the difference between ideal and actual usage
+        balance_loss = F.kl_div(torch.log(expert_usage), ideal_usage, reduction='batchmean')
         
         return balance_loss
-     
+        
     def calculate_specialization_loss(self, expert_weights, labels, num_classes):
-        """Encourage each expert to be strongly decisive about which classes it handles"""
         batch_size = expert_weights.size(0)
         
         # Get class-expert correlations
@@ -198,13 +187,13 @@ class MoE(nn.Module):
             labels_onehot        # [batch_size, num_classes]
         ) / batch_size          # [num_experts, num_classes]
         
-        # We want each expert to have high confidence (close to 0 or 1)
-        # for each class - encourage decisive behavior
-        decisiveness_loss = -torch.mean(
-            torch.abs(expert_class_correlation - 0.5)
+        # Encourage each expert to specialize by maximizing the correlation for one class
+        # and minimizing for others
+        specialization_loss = -torch.mean(
+            torch.max(expert_class_correlation, dim=1)[0]  # Take the max correlation for each expert
         )
         
-        return decisiveness_loss
+        return specialization_loss
 
 def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
     model.train()
