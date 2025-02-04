@@ -334,7 +334,7 @@ class MRI_Dataset(Dataset):
 
 def main():
     set_seed(42)
-    batch_size = 32  # Adjust based on your GPU memory
+    batch_size = 16  # Adjust based on your GPU memory
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -390,7 +390,7 @@ def main():
     optimizer = torch.optim.AdamW(params, weight_decay=0.01)
     
     # Calculate exact number of steps
-    total_epochs = 50  # Adjust based on your dataset size and resources
+    total_epochs = 100  # Adjust based on your dataset size and resources
     total_steps = total_epochs * len(trainloader)  
     
     # OneCycle scheduler with exact steps
