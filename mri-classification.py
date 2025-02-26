@@ -27,7 +27,7 @@ def set_seed(seed: Optional[int] = 42) -> None:
         os.environ['PYTHONHASHSEED'] = str(seed)
 
 class Expert(nn.Module):
-    """Enhanced expert with residual connections and batch norm"""
+    """Enhanced expert with residual connections and Swish activation"""
     def __init__(self, in_dim, hidden_dim):
         super().__init__()
         self.conv1 = nn.Conv2d(in_dim, hidden_dim, 3, padding=1)
@@ -39,13 +39,14 @@ class Expert(nn.Module):
         self.skip = nn.Sequential(
             nn.Conv2d(in_dim, in_dim, 1),
             nn.BatchNorm2d(in_dim)
-        ) if in_dim != hidden_dim else nn.Identity()
+        if in_dim != hidden_dim else nn.Identity()
+        )
         
     def forward(self, x):
         identity = self.skip(x)
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.silu(self.bn1(self.conv1(x)))  # Swish activation
         out = self.bn2(self.conv2(out))
-        return F.relu(out + identity)
+        return F.silu(out + identity)  # Swish activation
 
 class Gate(nn.Module):
     """Enhanced gating network with attention and regularization"""
@@ -57,7 +58,7 @@ class Gate(nn.Module):
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(in_dim, in_dim // 4, 1),
             nn.BatchNorm2d(in_dim // 4),
-            nn.ReLU(),
+            nn.SiLU(),  # Swish activation
             nn.Conv2d(in_dim // 4, 1, 1),
             nn.Sigmoid()
         )
@@ -69,7 +70,7 @@ class Gate(nn.Module):
         # Expert selection
         self.expert_gate = nn.Sequential(
             nn.Linear(in_dim * 2, in_dim // 2),
-            nn.ReLU(),
+            nn.SiLU(),  # Swish activation
             nn.Dropout(0.2),
             nn.Linear(in_dim // 2, num_experts)
         )
@@ -93,14 +94,14 @@ class Gate(nn.Module):
 
 class MoE(nn.Module):
     """Improved Mixture of Experts with enhanced components and regularization"""
-    def __init__(self, num_experts=8, expert_hidden_dim=256, temp=0.1, num_classes=4):
+    def __init__(self, num_experts=4, expert_hidden_dim=256, temp=0.1, num_classes=4):
         super().__init__()
-        # Backbone with larger feature maps
+        # Backbone with ImageNet normalization
         self.backbone = timm.create_model(
             'efficientnet_b2',
             pretrained=True,
             features_only=True,
-            out_indices=(1,)  # Use Stage 1 for 8x8 features
+            out_indices=(2,)  # Higher-level features
         )
         
         # Get feature dimensions
@@ -121,11 +122,14 @@ class MoE(nn.Module):
         self.classifier = nn.Sequential(
             nn.Conv2d(self.feature_dim, self.feature_dim, 3, padding=1),
             nn.BatchNorm2d(self.feature_dim),
-            nn.ReLU(),
+            nn.SiLU(),  # Swish activation
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dropout(0.3),
-            nn.Linear(self.feature_dim, num_classes)
+            nn.Linear(self.feature_dim, self.feature_dim // 2),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.feature_dim // 2, num_classes)
         )
     
     def forward(self, x, labels=None, n_classes=None, return_losses=False):
@@ -150,50 +154,53 @@ class MoE(nn.Module):
         output = self.classifier(combined)
         
         if return_losses and self.training:
-            # Load balancing loss
-            balance_loss = self.calculate_balance_loss(expert_weights, labels, n_classes)
+            # Auxiliary losses
+            balance_loss = self.calculate_balance_loss(expert_weights)
             specialization_loss = self.calculate_specialization_loss(expert_weights, labels, n_classes)
             
-            # Auxiliary losses dictionary
             losses = {
-                'balance_loss': balance_loss * 0.6,
-                'specialization_loss': specialization_loss * 0.4
+                'balance_loss': balance_loss * 0.5,
+                'specialization_loss': specialization_loss * 0.5
             }
             return output, losses
             
         return output
     
-    def calculate_balance_loss(self, expert_weights, labels, num_classes):
+    def calculate_balance_loss(self, expert_weights):
         num_experts = expert_weights.size(1)
-        
-        # Ideal usage should be uniform across all experts
-        ideal_usage = torch.ones(num_experts, device=expert_weights.device) / num_experts  # [num_experts]
-
-        # Get actual expert usage
-        expert_usage = expert_weights.mean(0)  # [num_experts]
-        
-        # Use KL divergence to measure the difference between ideal and actual usage
-        balance_loss = F.kl_div(torch.log(expert_usage), ideal_usage, reduction='batchmean')
-        
+        ideal_usage = torch.ones(num_experts, device=expert_weights.device) / num_experts
+        expert_usage = expert_weights.mean(0)
+        balance_loss = torch.sum((expert_usage - ideal_usage)**2)  # L2 loss
         return balance_loss
         
     def calculate_specialization_loss(self, expert_weights, labels, num_classes):
         batch_size = expert_weights.size(0)
-        
-        # Get class-expert correlations
         labels_onehot = F.one_hot(labels, num_classes).float()
-        expert_class_correlation = torch.matmul(
-            expert_weights.t(),  # [num_experts, batch_size]
-            labels_onehot        # [batch_size, num_classes]
-        ) / batch_size          # [num_experts, num_classes]
-        
-        # Encourage each expert to specialize by maximizing the correlation for one class
-        # and minimizing for others
-        specialization_loss = -torch.mean(
-            torch.max(expert_class_correlation, dim=1)[0]  # Take the max correlation for each expert
-        )
-        
-        return specialization_loss
+        expert_class_correlation = torch.matmul(expert_weights.t(), labels_onehot) / batch_size
+        # Encourage max correlation with margin
+        max_values = torch.max(expert_class_correlation, dim=1)[0]
+        second_max = torch.topk(expert_class_correlation, 2, dim=1).values[:, 1]
+        margin_loss = F.relu(second_max - max_values + 0.1).mean()  # Margin of 0.1
+        return margin_loss
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 
 def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
     model.train()
@@ -202,6 +209,7 @@ def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
     total = 0
     all_preds = []
     all_labels = []
+    focal_loss = FocalLoss()
     
     for inputs, targets in tqdm(loader, desc='Training'):
         inputs, targets = inputs.to(device), targets.to(device)
@@ -209,10 +217,10 @@ def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
         optimizer.zero_grad()
         outputs, aux_losses = model(inputs, targets, num_classes, return_losses=True)
         
-        # Main classification loss
-        task_loss = F.cross_entropy(outputs, targets)
+        # Focal loss with label smoothing - Good for imbalanced classes.
+        task_loss = focal_loss(outputs, targets)
         
-        # Combine all losses
+        # Combine losses
         loss = task_loss + aux_losses['balance_loss'] + aux_losses['specialization_loss']
         
         loss.backward()
@@ -323,8 +331,7 @@ class MRI_Dataset(Dataset):
 
 def main():
     set_seed(42)
-    batch_size = 16  # Adjust based on your GPU memory
-    # Device
+    batch_size = 16  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
@@ -333,22 +340,23 @@ def main():
         transforms.ToPILImage(),
         transforms.RandomResizedCrop((224,224)),
         transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(30),
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
-    # Only normalization for testing
+    # Normalize only for testing
     transform_test = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
+
     
     # Data loaders
-    train_dataset = MRI_Dataset(root_dir=R'C:\Users\Precision\Downloads\MRIs\Training', transform=transform_train)
-    test_dataset = MRI_Dataset(root_dir=R'C:\Users\Precision\Downloads\MRIs\Testing', transform=transform_test)
+    train_dataset = MRI_Dataset(root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Training', transform=transform_train)
+    test_dataset = MRI_Dataset(root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Testing', transform=transform_test)
     
     trainloader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, 
@@ -379,10 +387,9 @@ def main():
     optimizer = torch.optim.AdamW(params, weight_decay=0.01)
     
     # Calculate exact number of steps
-    total_epochs = 100  # Adjust based on your dataset size and resources
+    total_epochs = 77  
     total_steps = total_epochs * len(trainloader)  
     
-    # OneCycle scheduler with exact steps
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=[1e-4, 2e-4, 2e-4, 2e-4] ,  # Corresponding to param groups
@@ -392,7 +399,6 @@ def main():
         final_div_factor=1e4
     )
     
-    # Training loop
     best_accuracy = 0
     num_classes = 4
     for epoch in range(total_epochs):  
@@ -408,7 +414,6 @@ def main():
             print(f'Test Accuracy: {test_metrics['accuracy']:.3f}%')
             print(f'Test Precision: {test_metrics['precision']:.3f} | Test Recall: {test_metrics['recall']:.3f} | Test F1-Score: {test_metrics['f1_score']:.3f}')
             
-            # Plot and save confusion matrix
             all_preds = []
             all_labels = []
             with torch.no_grad():
