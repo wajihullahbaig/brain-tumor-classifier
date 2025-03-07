@@ -98,10 +98,10 @@ class MoE(nn.Module):
         super().__init__()
         # Backbone with ImageNet normalization
         self.backbone = timm.create_model(
-            'efficientnet_b2',
+            'swin_base_patch4_window7_224',
             pretrained=True,
             features_only=True,
-            out_indices=(2,)  # Higher-level features
+            out_indices=(3,)  # Higher-level features
         )
         
         # Get feature dimensions
@@ -338,10 +338,8 @@ def main():
     # Data augmentation and normalization for training
     transform_train = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.RandomResizedCrop((224,224)),
+        transforms.Resize((224,224)),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(30),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
