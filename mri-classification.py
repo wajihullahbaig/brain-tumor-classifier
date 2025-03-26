@@ -14,6 +14,198 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from sklearn.metrics import confusion_matrix
+from tqdm import tqdm
+
+class VisualizationTracker:
+    """Tracks and visualizes training metrics, confusion matrices, and expert activations."""
+    
+    def __init__(self, class_names, num_experts=2):
+        self.class_names = class_names
+        self.num_experts = num_experts
+        self.train_losses = []
+        self.train_accs = []
+        self.test_losses = []
+        self.test_accs = []
+        self.epochs = []
+        self.test_epochs = []  # Separate tracking for test epochs
+        self.expert_activations = []
+        
+        # Create output directory
+        os.makedirs('visualizations', exist_ok=True)
+    
+    def update_metrics(self, epoch, train_metrics, test_metrics=None):
+        """Update training and testing metrics."""
+        self.epochs.append(epoch)
+        self.train_losses.append(train_metrics['loss'])
+        self.train_accs.append(train_metrics['accuracy'])
+        
+        if test_metrics is not None:
+            self.test_epochs.append(epoch)  # Track which epochs have test metrics
+            self.test_losses.append(test_metrics.get('loss', 0))
+            self.test_accs.append(test_metrics['accuracy'])
+            
+        # Plot updated metrics
+        self.plot_metrics()
+    
+    def plot_metrics(self):
+        """Plot training and testing metrics."""
+        plt.figure(figsize=(12, 5))
+        
+        # Loss plot
+        plt.subplot(1, 2, 1)
+        plt.plot(self.epochs, self.train_losses, 'b-', label='Training Loss')
+        if len(self.test_losses) > 0:
+            plt.plot(self.test_epochs, self.test_losses, 'r-', label='Testing Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        current_epoch = self.epochs[-1]
+        plt.title(f'Loss Curves (Epoch {current_epoch}, Train: {self.train_losses[-1]:.4f})')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Accuracy plot
+        plt.subplot(1, 2, 2)
+        plt.plot(self.epochs, self.train_accs, 'b-', label='Training Accuracy')
+        if len(self.test_accs) > 0:
+            plt.plot(self.test_epochs, self.test_accs, 'r-', label='Testing Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy (%)')
+        plt.title(f'Accuracy Curves (Epoch {current_epoch}, Train: {self.train_accs[-1]:.2f}%)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('visualizations/train_test_metrics.png')
+        plt.close()
+    
+    def plot_confusion_matrix(self, labels, preds, epoch):
+        """Plot and save confusion matrix."""
+        cm = confusion_matrix(labels, preds)
+        cm_df = pd.DataFrame(cm, index=self.class_names, columns=self.class_names)
+        
+        # Save to CSV
+        cm_df.to_csv(f'visualizations/confusion_matrix.csv')
+        
+        # Plotting with epoch and accuracy info
+        accuracy = np.sum(np.diag(cm)) / np.sum(cm) * 100
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues')
+        plt.ylabel('Actual')
+        plt.xlabel('Predicted')
+        plt.title(f'Confusion Matrix - Epoch {epoch} (Accuracy: {accuracy:.2f}%)')
+        plt.savefig(f'visualizations/confusion_matrix.png')
+        plt.close()
+        
+        return cm_df
+    
+    def record_expert_activations(self, model, dataloader, device, epoch):
+        """Record and visualize expert activations across the dataset."""
+        model.eval()
+        expert_weights_by_class = {class_idx: [] for class_idx in range(len(self.class_names))}
+        
+        with torch.no_grad():
+            for inputs, targets in tqdm(dataloader, desc='Recording expert activations'):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # Extract backbone features
+                features = model.backbone(inputs)[0]
+                
+                # Get expert weights
+                expert_weights = model.gate(features, False)  # False for evaluation mode
+                
+                # Record weights by class
+                for i, target in enumerate(targets):
+                    class_idx = target.item()
+                    expert_weights_by_class[class_idx].append(expert_weights[i].cpu().numpy())
+        
+        # Average expert weights per class
+        avg_expert_weights = np.zeros((len(self.class_names), self.num_experts))
+        for class_idx, weights in expert_weights_by_class.items():
+            if weights:  # Check if the list is not empty
+                avg_expert_weights[class_idx] = np.mean(weights, axis=0)
+        
+        # Store for tracking over time
+        self.expert_activations.append((epoch, avg_expert_weights))
+        
+        # Plot expert activation heatmap
+        self.plot_expert_activations(epoch, avg_expert_weights)
+    
+    def plot_expert_activations(self, epoch, avg_expert_weights):
+        """Plot expert activation heatmap."""
+        plt.figure(figsize=(8, 6))
+        
+        expert_names = [f'Expert {i+1}' for i in range(self.num_experts)]
+        df = pd.DataFrame(avg_expert_weights, index=self.class_names, columns=expert_names)
+        
+        sns.heatmap(df, annot=True, fmt='.2f', cmap='viridis')
+        plt.title(f'Expert Activation by Class - Epoch {epoch}')
+        plt.ylabel('Class')
+        plt.xlabel('Expert')
+        plt.tight_layout()
+        plt.savefig(f'visualizations/expert_activations.png')
+        plt.close()
+
+# Function to create activation maps from the model
+def generate_activation_maps(model, sample_images, device, class_names, save_dir='visualizations'):
+    """Generate activation maps showing what each expert focuses on."""
+    os.makedirs(save_dir, exist_ok=True)
+    
+    model.eval()
+    with torch.no_grad():
+        for idx, (image, label) in enumerate(sample_images):
+            # Ensure image is on the right device and has batch dimension
+            image = image.unsqueeze(0).to(device)
+            
+            # Get backbone features
+            features = model.backbone(image)[0]
+            
+            # Get expert weights
+            expert_weights = model.gate(features, False)
+            expert_weights = expert_weights.cpu().numpy()[0]
+            
+            # Process through experts to get attention
+            expert_outputs = []
+            for i, expert in enumerate(model.experts):
+                # Forward through expert
+                expert_output = expert(features)
+                
+                # For visualization: get average activation across channels
+                activation = expert_output.mean(dim=1).cpu().numpy()[0]
+                
+                # Normalize for visualization
+                activation = (activation - activation.min()) / (activation.max() - activation.min() + 1e-8)
+                
+                expert_outputs.append(activation)
+            
+            # Original image (convert from tensor with normalization)
+            orig_img = image.squeeze().cpu().permute(1, 2, 0).numpy()
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            orig_img = std * orig_img + mean
+            orig_img = np.clip(orig_img, 0, 1)
+            
+            # Plot
+            class_name = class_names[label]
+            plt.figure(figsize=(12, 4))
+            
+            # Original image
+            plt.subplot(1, 3, 1)
+            plt.imshow(orig_img)
+            plt.title(f'Original: {class_name}')
+            plt.axis('off')
+            
+            # Expert activations
+            for i in range(min(2, len(expert_outputs))):
+                plt.subplot(1, 3, i+2)
+                plt.imshow(expert_outputs[i], cmap='viridis')
+                plt.title(f'Expert {i+1} (Weight: {expert_weights[i]:.2f})')
+                plt.axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(f'{save_dir}/activation_map_sample_{idx}_{class_name}.png')
+            plt.close()
 
 def set_seed(seed: Optional[int] = 42) -> None:
     """Set all random seeds for reproducibility"""
@@ -184,7 +376,7 @@ class MoE(nn.Module):
         return margin_loss
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+    def __init__(self, alpha=0.5, gamma=1.5, reduction='mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -246,13 +438,20 @@ def evaluate(model, loader, device, num_classes):
     model.eval()
     correct = 0
     total = 0
+    total_loss = 0
     all_preds = []
     all_labels = []
+    focal_loss = FocalLoss()
     
     with torch.no_grad():
         for inputs, targets in tqdm(loader, desc='Evaluating'):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
+            
+            # Calculate loss for tracking
+            loss = focal_loss(outputs, targets)
+            total_loss += loss.item()
+            
             _, predicted = outputs.max(1)
             correct += predicted.eq(targets).sum().item()
             total += targets.size(0)
@@ -262,6 +461,8 @@ def evaluate(model, loader, device, num_classes):
     
     metrics = calculate_metrics(all_labels, all_preds)
     metrics['accuracy'] = 100. * correct / total
+    # Add loss to metrics
+    metrics['loss'] = total_loss / len(loader)
     return metrics
 
 def calculate_metrics(labels, preds):
@@ -274,7 +475,7 @@ def calculate_metrics(labels, preds):
         'f1_score': f1
     }
 
-def plot_confusion_matrix(labels, preds, classes, save_path='confusion_matrix.csv'):
+def plot_confusion_matrix(labels, preds, classes, save_path='visualizations/confusion_matrix.csv'):
     cm = confusion_matrix(labels, preds)
     cm_df = pd.DataFrame(cm, index=classes, columns=classes)
     
@@ -365,13 +566,13 @@ def main():
         test_dataset, batch_size=batch_size, shuffle=False, 
         num_workers=4, pin_memory=True
     )
-    
+    num_experts = 4
     # Create model
     model = MoE(
-        num_experts=2,
+        num_experts=num_experts,
         expert_hidden_dim=128,
         temp=2.0,
-        num_classes=4
+        num_classes=10
     ).to(device)
     
     # Separate learning rates for different components
@@ -390,46 +591,89 @@ def main():
     
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[1e-4, 2e-4, 2e-4, 2e-4] ,  # Corresponding to param groups
+        max_lr=[1e-4, 2e-4, 2e-4, 2e-4],  # Corresponding to param groups
         total_steps=total_steps,
         pct_start=0.2,
         anneal_strategy='cos',
         final_div_factor=1e4
     )
     
+    # Initialize visualization tracker
+    tracker = VisualizationTracker(
+        class_names=list(train_dataset.class_mapping.keys()), 
+        num_experts=num_experts
+    )
+    
+    # Create directories for visualizations
+    os.makedirs('visualizations', exist_ok=True)
+    
+    # Loss history for plotting
+    train_loss_history = []
+    test_loss_history = []
+    
     best_accuracy = 0
     num_classes = 4
-    for epoch in range(total_epochs):  
-        print(f'\nEpoch: {epoch+1}')
+    
+    # Select a few sample images for activation maps
+    sample_indices = [i * (len(test_dataset) // 8) for i in range(4)]  # 4 well-distributed samples
+    sample_images = [test_dataset[i] for i in sample_indices]
+    
+    for epoch in range(total_epochs):
+        print(f'\nEpoch: {epoch+1}/{total_epochs}')
+        
+        # Train for one epoch
         train_metrics = train_epoch(
             model, trainloader, optimizer, scheduler, num_classes, device
         )
-        print(f'Train Loss: {train_metrics['loss']:.3f} | Train Accuracy: {train_metrics['accuracy']:.3f}%')
-        print(f'Train Precision: {train_metrics['precision']:.3f} | Train Recall: {train_metrics['recall']:.3f} | Train F1-Score: {train_metrics['f1_score']:.3f}')
+        print(f'Train Loss: {train_metrics["loss"]:.3f} | Train Accuracy: {train_metrics["accuracy"]:.3f}%')
+        print(f'Train Precision: {train_metrics["precision"]:.3f} | Train Recall: {train_metrics["recall"]:.3f} | Train F1-Score: {train_metrics["f1_score"]:.3f}')
         
-        if epoch % 5 == 0:  
+        # Update metrics tracking (without test metrics)
+        tracker.update_metrics(epoch+1, train_metrics)
+        
+        # Every 5 epochs, run evaluation
+        if epoch % 5 == 0 or epoch == total_epochs - 1:  
+            # Evaluate on test set
             test_metrics = evaluate(model, testloader, device, num_classes)
-            print(f'Test Accuracy: {test_metrics['accuracy']:.3f}%')
-            print(f'Test Precision: {test_metrics['precision']:.3f} | Test Recall: {test_metrics['recall']:.3f} | Test F1-Score: {test_metrics['f1_score']:.3f}')
+            print(f'Test Accuracy: {test_metrics["accuracy"]:.3f}%')
+            print(f'Test Precision: {test_metrics["precision"]:.3f} | Test Recall: {test_metrics["recall"]:.3f} | Test F1-Score: {test_metrics["f1_score"]:.3f}')
             
+            # Update metrics with test data
+            tracker.update_metrics(epoch+1, train_metrics, test_metrics)
+            
+            # Get predictions for confusion matrix
             all_preds = []
             all_labels = []
             with torch.no_grad():
-                for inputs, targets in tqdm(testloader, desc='Evaluating for Confusion Matrix'):
+                for inputs, targets in tqdm(testloader, desc='Generating confusion matrix'):
                     inputs = inputs.to(device)
                     outputs = model(inputs)
                     _, predicted = outputs.max(1)
                     all_preds.extend(predicted.cpu().numpy())
                     all_labels.extend(targets.numpy())
             
-            classes = list(train_dataset.class_mapping.keys())
-            cm_df = plot_confusion_matrix(all_labels, all_preds, classes, save_path='confusion_matrix.csv')
+            # Plot confusion matrix with epoch info
+            tracker.plot_confusion_matrix(all_labels, all_preds, epoch+1)
             
+            # Record expert activations across test set
+            tracker.record_expert_activations(model, testloader, device, epoch+1)
+            
+            # Generate activation maps for sample images
+            generate_activation_maps(
+                model, 
+                sample_images, 
+                device, 
+                list(train_dataset.class_mapping.keys()),
+                save_dir=f'visualizations'
+            )
+            
+            # Save best model
             if test_metrics['accuracy'] > best_accuracy:
                 best_accuracy = test_metrics['accuracy']
                 torch.save(model.state_dict(), 'best_model.pth')
-    
-    print(f'Best Test Accuracy: {best_accuracy:.3f}%')
+                print(f'New best model saved with accuracy: {best_accuracy:.3f}%')
+        
+    print(f'Training completed. Best Test Accuracy: {best_accuracy:.3f}%')
 
 
 if __name__ == '__main__':

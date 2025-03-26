@@ -15,8 +15,8 @@ Using pytorch's TIMM package to solve a classification problem
 
 ## Results
 
-![Confusion Matrix](confusion_matrix.png)
+![Confusion Matrix](visualizations/confusion_matrix.png)
 
-![Train/Test metrics](train_test_metrics.png)
+![Train/Test metrics](visualizations/train_test_metrics.png)
 
-![Loss](loss.png)
+![Expert Activations](visualizations/expert_activations.png)
