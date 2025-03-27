@@ -16,6 +16,99 @@ import pandas as pd
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
+import torchvision.transforms.functional as TF
+
+def set_seed(seed: Optional[int] = 42) -> None:
+    """Set all random seeds for reproducibility"""
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ['PYTHONHASHSEED'] = str(seed)
+class AutomaticBrightnessAndContrast(torch.nn.Module):
+    """Transform to automatically adjust brightness and contrast of images."""
+    
+    def __init__(self, clip_hist_percent=1):
+        super().__init__()
+        self.clip_hist_percent = clip_hist_percent
+    
+    def forward(self, image_tensor):
+        """
+        Apply automatic brightness and contrast adjustment to an image tensor.
+        
+        Args:
+            image_tensor (torch.Tensor): Image tensor of shape [C, H, W] in [0,1] range
+            
+        Returns:
+            torch.Tensor: Adjusted image tensor in same range as input
+        """
+        
+        image = image_tensor.clone()
+        
+        # Check if image is in [0,1] range (standard for ToTensor output)
+        is_normalized = image.max() <= 1.0
+        
+        # Scale to [0,255] range for histogram calculation
+        if is_normalized:
+            image_for_hist = image * 255.0
+        else:
+            image_for_hist = image
+        
+        # Convert image tensor to grayscale if it's RGB
+        if image_for_hist.shape[0] == 3:  # If RGB (C, H, W format)
+            # Convert to grayscale using RGB weights
+            gray = 0.299 * image_for_hist[0] + 0.587 * image_for_hist[1] + 0.114 * image_for_hist[2]
+        else:
+            gray = image_for_hist.squeeze()  # If already grayscale
+        
+        # Calculate histogram
+        hist = torch.histc(gray.flatten(), bins=256, min=0, max=255)
+        hist_size = len(hist)
+        
+        # Calculate cumulative distribution
+        accumulator = torch.cumsum(hist, dim=0)
+        
+        # Locate points to clip
+        maximum = accumulator[-1].item()
+        clip_value = self.clip_hist_percent * (maximum / 100.0) / 2.0
+        
+        # Locate left cut
+        minimum_gray = 0
+        while minimum_gray < hist_size and accumulator[minimum_gray].item() < clip_value:
+            minimum_gray += 1
+        
+        # Locate right cut
+        maximum_gray = hist_size - 1
+        while maximum_gray >= 0 and accumulator[maximum_gray].item() >= (maximum - clip_value):
+            maximum_gray -= 1
+        
+        # Prevent division by zero
+        if maximum_gray <= minimum_gray:
+            # No adjustment needed or possible
+            return image_tensor
+        
+        # Calculate alpha and beta values
+        alpha = 255.0 / (maximum_gray - minimum_gray)
+        beta = -minimum_gray * alpha
+        
+        # Apply contrast stretching based on original image range
+        if is_normalized:
+            # For [0,1] range images (from ToTensor)
+            alpha_norm = alpha / 255.0
+            beta_norm = beta / 255.0
+            auto_result = image * alpha_norm + beta_norm
+            # Clamp values to [0, 1] range
+            auto_result = torch.clamp(auto_result, 0, 1)
+        else:
+            # For [0,255] range images
+            auto_result = image * alpha + beta
+            # Clamp values to [0, 255] range
+            auto_result = torch.clamp(auto_result, 0, 255)
+        
+        return auto_result
 
 class VisualizationTracker:
     """Tracks and visualizes training metrics, confusion matrices, and expert activations."""
@@ -147,19 +240,33 @@ class VisualizationTracker:
         plt.savefig(f'visualizations/expert_activations.png')
         plt.close()
 
-# Function to create activation maps from the model
 def generate_activation_maps(model, sample_images, device, class_names, save_dir='visualizations'):
-    """Generate activation maps showing what each expert focuses on."""
+    """Generate activation maps showing what each expert focuses on for MRI images."""
     os.makedirs(save_dir, exist_ok=True)
+    
+    # ImageNet normalization parameters that were applied
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
     
     model.eval()
     with torch.no_grad():
         for idx, (image, label) in enumerate(sample_images):
-            # Ensure image is on the right device and has batch dimension
-            image = image.unsqueeze(0).to(device)
+            
+            # For MRI images: Since all 3 channels are identical (replicated grayscale),
+            # we can just take one channel and denormalize it
+            img_np = image[0].cpu().numpy()  # Take first channel
+            
+            # Undo the normalization for this channel
+            denorm_img = img_np * std[0] + mean[0]
+            
+            # Ensure values are in valid range for display
+            denorm_img = np.clip(denorm_img, 0, 1)
+            
+            # Ensure image is on the right device and has batch dimension for model
+            model_input = image.unsqueeze(0).to(device)
             
             # Get backbone features
-            features = model.backbone(image)[0]
+            features = model.backbone(model_input)[0]
             
             # Get expert weights
             expert_weights = model.gate(features, False)
@@ -179,25 +286,18 @@ def generate_activation_maps(model, sample_images, device, class_names, save_dir
                 
                 expert_outputs.append(activation)
             
-            # Original image (convert from tensor with normalization)
-            orig_img = image.squeeze().cpu().permute(1, 2, 0).numpy()
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
-            orig_img = std * orig_img + mean
-            orig_img = np.clip(orig_img, 0, 1)
-            
             # Plot
             class_name = class_names[label]
             plt.figure(figsize=(12, 4))
             
-            # Original image
+            # Original MRI image - display as grayscale
             plt.subplot(1, 3, 1)
-            plt.imshow(orig_img)
-            plt.title(f'Original: {class_name}')
+            plt.imshow(denorm_img, cmap='gray')
+            plt.title(f'Original MRI: {class_name}')
             plt.axis('off')
             
             # Expert activations
-            for i in range(min(1, len(expert_outputs))):
+            for i in range(min(2, len(expert_outputs))):
                 plt.subplot(1, 3, i+2)
                 plt.imshow(expert_outputs[i], cmap='viridis')
                 plt.title(f'Expert {i+1} (Weight: {expert_weights[i]:.2f})')
@@ -207,16 +307,6 @@ def generate_activation_maps(model, sample_images, device, class_names, save_dir
             plt.savefig(f'{save_dir}/activation_map_sample_{idx}_{class_name}.png')
             plt.close()
 
-def set_seed(seed: Optional[int] = 42) -> None:
-    """Set all random seeds for reproducibility"""
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        os.environ['PYTHONHASHSEED'] = str(seed)
 
 class Expert(nn.Module):
     """Enhanced expert with residual connections and Swish activation"""
@@ -401,7 +491,8 @@ def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
     total = 0
     all_preds = []
     all_labels = []
-    focal_loss = FocalLoss()
+    main_loss = FocalLoss()
+    main_loss = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     
     for inputs, targets in tqdm(loader, desc='Training'):
         inputs, targets = inputs.to(device), targets.to(device)
@@ -410,7 +501,7 @@ def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
         outputs, aux_losses = model(inputs, targets, num_classes, return_losses=True)
         
         # Focal loss with label smoothing - Good for imbalanced classes.
-        task_loss = focal_loss(outputs, targets)
+        task_loss = main_loss(outputs, targets)
         
         # Combine losses
         loss = task_loss + aux_losses['balance_loss'] + aux_losses['specialization_loss']
@@ -535,13 +626,14 @@ def main():
     batch_size = 32  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    
+    # mean and std are from imagenet
     # Data augmentation and normalization for training
     transform_train = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
+        AutomaticBrightnessAndContrast(clip_hist_percent=1),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     # Normalize only for testing
@@ -549,6 +641,7 @@ def main():
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.ToTensor(),
+        AutomaticBrightnessAndContrast(clip_hist_percent=1),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
@@ -672,7 +765,7 @@ def main():
                 best_accuracy = test_metrics['accuracy']
                 torch.save(model.state_dict(), 'best_model.pth')
                 print(f'New best model saved with accuracy: {best_accuracy:.3f}%')
-        
+            
     print(f'Training completed. Best Test Accuracy: {best_accuracy:.3f}%')
 
 
