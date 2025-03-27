@@ -197,7 +197,7 @@ def generate_activation_maps(model, sample_images, device, class_names, save_dir
             plt.axis('off')
             
             # Expert activations
-            for i in range(min(2, len(expert_outputs))):
+            for i in range(min(1, len(expert_outputs))):
                 plt.subplot(1, 3, i+2)
                 plt.imshow(expert_outputs[i], cmap='viridis')
                 plt.title(f'Expert {i+1} (Weight: {expert_weights[i]:.2f})')
@@ -532,7 +532,7 @@ class MRI_Dataset(Dataset):
 
 def main():
     set_seed(42)
-    batch_size = 16  
+    batch_size = 32  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
