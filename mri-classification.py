@@ -110,6 +110,26 @@ class AutomaticBrightnessAndContrast(torch.nn.Module):
         
         return auto_result
 
+class IntensityClamp(torch.nn.Module):
+    """Clamp intensity values to handle outliers in MRI images"""
+    def __init__(self, percentile_low=1, percentile_high=99):
+        super().__init__()
+        self.percentile_low = percentile_low
+        self.percentile_high = percentile_high
+        
+    def forward(self, x):
+        # Process first channel for MRI (as they're duplicated)
+        if x.shape[0] == 3 and torch.all(x[0] == x[1]) and torch.all(x[1] == x[2]):
+            x_channel = x[0]
+            values = x_channel[x_channel > 0]  # Consider only non-zero values
+            if len(values) > 0:
+                p_low = torch.quantile(values, self.percentile_low/100)
+                p_high = torch.quantile(values, self.percentile_high/100)
+                
+                # Apply to all channels (they're identical)
+                for c in range(x.shape[0]):
+                    x[c] = torch.clamp(x[c], p_low, p_high)
+        return x
 class VisualizationTracker:
     """Tracks and visualizes training metrics, confusion matrices, and expert activations."""
     
@@ -240,13 +260,10 @@ class VisualizationTracker:
         plt.savefig(f'visualizations/expert_activations.png')
         plt.close()
 
-def generate_activation_maps(model, sample_images, device, class_names, save_dir='visualizations'):
+def generate_activation_maps(model, sample_images, device, class_names, mean,std, save_dir='visualizations'):
     """Generate activation maps showing what each expert focuses on for MRI images."""
     os.makedirs(save_dir, exist_ok=True)
     
-    # ImageNet normalization parameters that were applied
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
     
     model.eval()
     with torch.no_grad():
@@ -621,12 +638,56 @@ class MRI_Dataset(Dataset):
             image = self.transform(image)
         return image, label
 
+def calculate_normalization_params(dataset, batch_size=32):
+    """Calculate the mean and std of the dataset for normalization"""
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=False
+    )
+    
+    # For MRI images converted to 3-channel (but identical channels)
+    mean = 0.0
+    std = 0.0
+    total_samples = 0
+    
+    for images, _ in tqdm(loader, desc="Calculating normalization parameters"):
+        batch_samples = images.size(0)
+        # Since channels are identical for MRI (replicated grayscale), just use one channel
+        images = images[:, 0, :, :].view(batch_samples, -1)
+        mean += images.mean(1).sum().item()
+        std += images.std(1).sum().item()
+        total_samples += batch_samples
+            
+    mean /= total_samples
+    std /= total_samples
+    
+    # For 3-channel representation
+    return [mean, mean, mean], [std, std, std]
+
+
 def main():
     set_seed(42)
     batch_size = 24  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    # mean and std are from imagenet
+    
+    # Create a dataset without normalization first
+    temp_dataset = MRI_Dataset(
+        root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Training', 
+        transform=transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224,224)),
+            transforms.ToTensor(),
+            AutomaticBrightnessAndContrast(clip_hist_percent=1),
+            IntensityClamp(percentile_low=1, percentile_high=99),
+        ])
+    )
+
+    mri_mean, mri_std = calculate_normalization_params(temp_dataset)
+    print(f"MRI Dataset - Mean: {mri_mean[0]:.4f}, Std: {mri_std[0]:.4f}")
+    
     # Data augmentation and normalization for training
     transform_train = transforms.Compose([
         transforms.ToPILImage(),
@@ -634,19 +695,20 @@ def main():
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         AutomaticBrightnessAndContrast(clip_hist_percent=1),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        IntensityClamp(percentile_low=1, percentile_high=99),
+        transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
-    # Normalize only for testing
+    # No augumentation, only Normalize for testing
     transform_test = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.ToTensor(),
         AutomaticBrightnessAndContrast(clip_hist_percent=1),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        IntensityClamp(percentile_low=1, percentile_high=99),
+        transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
 
     
-    # Data loaders
     train_dataset = MRI_Dataset(root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Training', transform=transform_train)
     test_dataset = MRI_Dataset(root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Testing', transform=transform_test)
     
@@ -659,13 +721,14 @@ def main():
         test_dataset, batch_size=batch_size, shuffle=False, 
         num_workers=4, pin_memory=True
     )
+    
     num_experts = 4
-    # Create model
+    num_classes = 4
     model = MoE(
         num_experts=num_experts,
         expert_hidden_dim=128,
         temp=2.0,
-        num_classes=10
+        num_classes=num_classes
     ).to(device)
     
     # Separate learning rates for different components
@@ -678,7 +741,6 @@ def main():
     
     optimizer = torch.optim.AdamW(params, weight_decay=0.01)
     
-    # Calculate exact number of steps
     total_epochs = 100  
     total_steps = total_epochs * len(trainloader)  
     
@@ -691,21 +753,13 @@ def main():
         final_div_factor=1e4
     )
     
-    # Initialize visualization tracker
     tracker = VisualizationTracker(
         class_names=list(train_dataset.class_mapping.keys()), 
         num_experts=num_experts
     )
     
-    # Create directories for visualizations
     os.makedirs('visualizations', exist_ok=True)
-    
-    # Loss history for plotting
-    train_loss_history = []
-    test_loss_history = []
-    
     best_accuracy = 0
-    num_classes = 4
     
     # Select a few sample images for activation maps
     sample_indices = [i * (len(test_dataset) // 8) for i in range(4)]  # 4 well-distributed samples
@@ -726,12 +780,10 @@ def main():
         
         # Every 5 epochs, run evaluation
         if epoch % 5 == 0 or epoch == total_epochs - 1:  
-            # Evaluate on test set
             test_metrics = evaluate(model, testloader, device, num_classes)
             print(f'Test Accuracy: {test_metrics["accuracy"]:.3f}%')
             print(f'Test Precision: {test_metrics["precision"]:.3f} | Test Recall: {test_metrics["recall"]:.3f} | Test F1-Score: {test_metrics["f1_score"]:.3f}')
             
-            # Update metrics with test data
             tracker.update_metrics(epoch+1, train_metrics, test_metrics)
             
             # Get predictions for confusion matrix
@@ -745,10 +797,7 @@ def main():
                     all_preds.extend(predicted.cpu().numpy())
                     all_labels.extend(targets.numpy())
             
-            # Plot confusion matrix with epoch info
-            tracker.plot_confusion_matrix(all_labels, all_preds, epoch+1)
-            
-            # Record expert activations across test set
+            tracker.plot_confusion_matrix(all_labels, all_preds, epoch+1)            
             tracker.record_expert_activations(model, testloader, device, epoch+1)
             
             # Generate activation maps for sample images
@@ -757,10 +806,11 @@ def main():
                 sample_images, 
                 device, 
                 list(train_dataset.class_mapping.keys()),
+                mri_mean,
+                mri_std,
                 save_dir=f'visualizations'
             )
             
-            # Save best model
             if test_metrics['accuracy'] > best_accuracy:
                 best_accuracy = test_metrics['accuracy']
                 torch.save(model.state_dict(), 'best_model.pth')
