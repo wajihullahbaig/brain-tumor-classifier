@@ -492,7 +492,7 @@ def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
     all_preds = []
     all_labels = []
     main_loss = FocalLoss()
-    main_loss = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    #main_loss = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     
     for inputs, targets in tqdm(loader, desc='Training'):
         inputs, targets = inputs.to(device), targets.to(device)
@@ -623,7 +623,7 @@ class MRI_Dataset(Dataset):
 
 def main():
     set_seed(42)
-    batch_size = 32  
+    batch_size = 24  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     # mean and std are from imagenet
@@ -679,7 +679,7 @@ def main():
     optimizer = torch.optim.AdamW(params, weight_decay=0.01)
     
     # Calculate exact number of steps
-    total_epochs = 77  
+    total_epochs = 100  
     total_steps = total_epochs * len(trainloader)  
     
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
