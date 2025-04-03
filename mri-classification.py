@@ -483,16 +483,20 @@ class MoE(nn.Module):
         return margin_loss
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.5, gamma=1.5, reduction='mean'):
+    def __init__(self, alpha=0.5, gamma=2.0, reduction='mean', weight=None):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        self.weight = weight  # Class weights
 
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        ce_loss = F.cross_entropy(inputs, targets, 
+                                 reduction='none', 
+                                 weight=self.weight)
         pt = torch.exp(-ce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
@@ -501,16 +505,20 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 
-def train_epoch(model, loader, optimizer, scheduler, num_classes, device):
+def train_epoch(model, loader, optimizer, scheduler, num_classes,class_weights, device):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
     all_preds = []
     all_labels = []
-    main_loss = FocalLoss()
-    #main_loss = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-    
+
+    if class_weights is not None:
+        weights = torch.FloatTensor(class_weights).to(device)
+        main_loss = FocalLoss(weight=weights)
+    else:
+        main_loss = FocalLoss()
+        
     for inputs, targets in tqdm(loader, desc='Training'):
         inputs, targets = inputs.to(device), targets.to(device)
         
@@ -666,6 +674,26 @@ def calculate_normalization_params(dataset, batch_size=32):
     # For 3-channel representation
     return [mean, mean, mean], [std, std, std]
 
+def calculate_class_weights(dataset):
+    """Calculate class weights inversely proportional to class frequencies"""
+    class_counts = np.zeros(len(dataset.class_mapping))
+    for _, label in dataset:
+        class_counts[label] += 1
+    
+    # Handle potential zero counts
+    class_counts = np.maximum(class_counts, 1)
+    
+    # Inverse frequency weighting
+    weights = 1.0 / class_counts
+    
+    # Normalize weights to sum to number of classes
+    weights = weights * len(dataset.class_mapping) / weights.sum()
+    
+    print(f"Class counts: {class_counts}")
+    print(f"Class weights: {weights}")
+    
+    return weights
+
 
 def main():
     set_seed(42)
@@ -688,6 +716,7 @@ def main():
     mri_mean, mri_std = calculate_normalization_params(temp_dataset)
     print(f"MRI Dataset - Mean: {mri_mean[0]:.4f}, Std: {mri_std[0]:.4f}")
     
+    class_weights = calculate_class_weights(temp_dataset)
     # Data augmentation and normalization for training
     transform_train = transforms.Compose([
         transforms.ToPILImage(),
@@ -770,7 +799,7 @@ def main():
         
         # Train for one epoch
         train_metrics = train_epoch(
-            model, trainloader, optimizer, scheduler, num_classes, device
+            model, trainloader, optimizer, scheduler, num_classes,class_weights, device
         )
         print(f'Train Loss: {train_metrics["loss"]:.3f} | Train Accuracy: {train_metrics["accuracy"]:.3f}%')
         print(f'Train Precision: {train_metrics["precision"]:.3f} | Train Recall: {train_metrics["recall"]:.3f} | Train F1-Score: {train_metrics["f1_score"]:.3f}')
