@@ -694,22 +694,57 @@ def calculate_class_weights(dataset):
     
     return weights
 
+def get_class_samples(dataset, num_per_class=1):
+    """Select representative samples from each class in the dataset"""
+    class_samples = {}
+    class_counts = {}
+    
+    # Initialize counters for each class
+    for class_name in dataset.class_mapping.keys():
+        class_samples[class_name] = []
+        class_counts[class_name] = 0
+    
+    # Collect samples until we have enough from each class
+    for idx in range(len(dataset)):
+        image, label = dataset[idx]
+        
+        # Get class name from label
+        class_name = list(dataset.class_mapping.keys())[list(dataset.class_mapping.values()).index(label)]
+        
+        # If we need more samples from this class
+        if class_counts[class_name] < num_per_class:
+            class_samples[class_name].append((image, label))
+            class_counts[class_name] += 1
+        
+        # Exit if we have enough samples from all classes
+        if all(count >= num_per_class for count in class_counts.values()):
+            break
+    
+    # Flatten the samples list
+    samples = []
+    for class_name in class_samples:
+        samples.extend(class_samples[class_name])
+    
+    return samples
 
 def main():
     set_seed(42)
-    batch_size = 24  
+    batch_size = 32  
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
     # Create a dataset without normalization first
+    clip_hist_percent = 0.5
+    percentile_low = 1.0
+    percentile_high = 100.0 - percentile_low
     temp_dataset = MRI_Dataset(
         root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Training', 
         transform=transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((224,224)),
             transforms.ToTensor(),
-            AutomaticBrightnessAndContrast(clip_hist_percent=1),
-            IntensityClamp(percentile_low=1, percentile_high=99),
+            #AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
+            #IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
         ])
     )
 
@@ -723,8 +758,8 @@ def main():
         transforms.Resize((224,224)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        AutomaticBrightnessAndContrast(clip_hist_percent=1),
-        IntensityClamp(percentile_low=1, percentile_high=99),
+        #AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
+        #IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
         transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
     # No augumentation, only Normalize for testing
@@ -732,8 +767,8 @@ def main():
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.ToTensor(),
-        AutomaticBrightnessAndContrast(clip_hist_percent=1),
-        IntensityClamp(percentile_low=1, percentile_high=99),
+        #AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
+        #IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
         transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
 
@@ -791,8 +826,8 @@ def main():
     best_accuracy = 0
     
     # Select a few sample images for activation maps
-    sample_indices = [i * (len(test_dataset) // 8) for i in range(4)]  # 4 well-distributed samples
-    sample_images = [test_dataset[i] for i in sample_indices]
+    sample_images = get_class_samples(test_dataset)
+    print(f"Selected {len(sample_images)} samples for visualization, one from each class")
     
     for epoch in range(total_epochs):
         print(f'\nEpoch: {epoch+1}/{total_epochs}')
@@ -834,7 +869,7 @@ def main():
                 model, 
                 sample_images, 
                 device, 
-                list(train_dataset.class_mapping.keys()),
+                list(test_dataset.class_mapping.keys()),
                 mri_mean,
                 mri_std,
                 save_dir=f'visualizations'
