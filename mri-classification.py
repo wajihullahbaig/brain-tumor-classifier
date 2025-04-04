@@ -28,6 +28,129 @@ def set_seed(seed: Optional[int] = 42) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         os.environ['PYTHONHASHSEED'] = str(seed)
+
+class AutomaticGammaCorrection(nn.Module):
+    """
+    Automatic gamma correction for MRI images.
+    Adaptively adjusts image contrast without requiring manual parameter tuning.
+    """
+    def __init__(self, min_gamma=0.7, max_gamma=1.4, epsilon=1e-6, lower_clip=0.02, upper_clip=0.98):
+        super().__init__()
+        self.min_gamma = min_gamma
+        self.max_gamma = max_gamma
+        self.epsilon = epsilon
+        self.lower_clip = lower_clip  # Percentile for lower bound clipping
+        self.upper_clip = upper_clip  # Percentile for upper bound clipping
+        
+    def forward(self, image):
+        """
+        Apply automatic gamma correction to an image tensor.
+        
+        Args:
+            image (torch.Tensor): Image tensor of shape [C, H, W] in [0,1] range
+            
+        Returns:
+            torch.Tensor: Gamma-corrected image tensor in same range as input
+        """
+        # Check if image is already in [0,1] range
+        if image.max() > 1.0:
+            image = image / 255.0
+            
+        # For MRI images (replicated grayscale), process only one channel if needed
+        if image.shape[0] == 3 and torch.all(image[0] == image[1]) and torch.all(image[1] == image[2]):
+            # Get first channel and calculate statistics only once
+            x_channel = image[0]
+            
+            # Skip empty images
+            if torch.all(x_channel <= self.epsilon):
+                return image
+                
+            # Only consider non-background pixels (common in MRI)
+            mask = x_channel > self.epsilon
+            if not torch.any(mask):
+                return image
+                
+            # First, apply percentile-based intensity clipping to handle outliers
+            if torch.sum(mask) > 0:
+                p_low = torch.quantile(x_channel[mask], self.lower_clip)
+                p_high = torch.quantile(x_channel[mask], self.upper_clip)
+                x_clipped = torch.clamp(x_channel, p_low, p_high)
+            else:
+                x_clipped = x_channel
+            
+            # Normalize to [0,1] after clipping
+            x_norm = (x_clipped - x_clipped.min()) / (x_clipped.max() - x_clipped.min() + self.epsilon)
+            
+            # Compute mean luminance of non-background pixels after clipping
+            mask_norm = x_norm > self.epsilon
+            if torch.sum(mask_norm) > 0:
+                mean_luminance = torch.mean(x_norm[mask_norm])
+            else:
+                mean_luminance = torch.mean(x_norm)
+            
+            # For MRI images, we usually want to brighten rather than darken
+            # If mean is low (dark image), use gamma < 1 to brighten
+            # Start with gamma = 1.0 (no change) and adjust based on mean
+            base_gamma = 1.0
+            if mean_luminance < 0.4:  # If image is too dark
+                # More aggressive brightening for darker images
+                gamma = base_gamma - (0.4 - mean_luminance) * 0.8
+            elif mean_luminance > 0.6:  # If image is too bright
+                # Slight darkening for brighter images
+                gamma = base_gamma + (mean_luminance - 0.6) * 0.5
+            else:
+                # Leave moderate brightness images mostly unchanged
+                gamma = base_gamma
+            
+            # Clamp gamma to reasonable range - proper tensor construction
+            if isinstance(gamma, torch.Tensor):
+                gamma = torch.clamp(gamma, self.min_gamma, self.max_gamma)
+            else:
+                gamma = torch.clamp(torch.tensor(gamma, device=image.device), self.min_gamma, self.max_gamma)
+            
+            # Apply the correction to all channels (since they're identical)
+            # Create a copy of the original image for correction
+            corrected = torch.zeros_like(image)
+            for c in range(image.shape[0]):
+                # Normalize each channel to [0,1] range
+                channel = (image[c] - image[c].min()) / (image[c].max() - image[c].min() + self.epsilon)
+                # Apply gamma correction
+                corrected[c] = torch.pow(channel + self.epsilon, gamma)
+            
+            # Normalize to [0,1] range
+            corrected = (corrected - corrected.min()) / (corrected.max() - corrected.min() + self.epsilon)
+            
+            return corrected
+        else:
+            # For true RGB images (not our case with MRI), process each channel
+            # Apply standard gamma correction with estimated gamma for each channel
+            corrected = torch.zeros_like(image)
+            
+            for c in range(image.shape[0]):
+                x_channel = image[c]
+                
+                # Skip empty channels
+                if torch.all(x_channel <= self.epsilon):
+                    corrected[c] = x_channel
+                    continue
+                
+                # Compute mean luminance
+                mean_luminance = torch.mean(x_channel)
+                
+                # Estimate gamma based on mean luminance
+                target = 0.5
+                gamma = torch.log(mean_luminance + self.epsilon) / torch.log(torch.tensor(target, device=image.device))
+                
+                # Clamp gamma to reasonable range
+                gamma = torch.clamp(gamma, self.min_gamma, self.max_gamma)
+                
+                # Apply gamma correction
+                corrected[c] = torch.pow(x_channel + self.epsilon, gamma)
+            
+            # Normalize to [0,1] range
+            corrected = (corrected - corrected.min()) / (corrected.max() - corrected.min() + self.epsilon)
+            
+            return corrected
 class AutomaticBrightnessAndContrast(torch.nn.Module):
     """Transform to automatically adjust brightness and contrast of images."""
     
@@ -747,8 +870,7 @@ def main():
             transforms.ToPILImage(),
             transforms.Resize((224,224)),
             transforms.ToTensor(),
-            AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
-            IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+            AutomaticGammaCorrection(),
             
         ])
     )
@@ -763,8 +885,7 @@ def main():
         transforms.Resize((224,224)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
-        IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+        AutomaticGammaCorrection(),
         transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
     # No augumentation, only Normalize for testing
@@ -772,8 +893,7 @@ def main():
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.ToTensor(),
-        AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
-        IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+        AutomaticGammaCorrection(),
         transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
 
