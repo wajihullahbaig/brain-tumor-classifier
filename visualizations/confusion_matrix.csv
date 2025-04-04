@@ -1,5 +1,5 @@
 ,pituitary,notumor,meningioma,glioma
 pituitary,298,0,2,0
-notumor,0,404,1,0
-meningioma,4,0,302,0
+notumor,0,405,0,0
+meningioma,1,0,305,0
 glioma,0,0,1,299

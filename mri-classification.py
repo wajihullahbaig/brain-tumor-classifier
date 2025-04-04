@@ -108,6 +108,10 @@ class AutomaticBrightnessAndContrast(torch.nn.Module):
             # Clamp values to [0, 255] range
             auto_result = torch.clamp(auto_result, 0, 255)
         
+        # Rescale to [0, 1] range if not already normalized
+        if not is_normalized:
+            auto_result = auto_result / 255.0
+        
         return auto_result
 
 class IntensityClamp(torch.nn.Module):
@@ -734,17 +738,18 @@ def main():
     print(f'Using device: {device}')
     
     # Create a dataset without normalization first
-    clip_hist_percent = 0.5
-    percentile_low = 1.0
-    percentile_high = 100.0 - percentile_low
+    clip_hist_percent = 2
+    percentile_low = 5
+    percentile_high = 95
     temp_dataset = MRI_Dataset(
         root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Training', 
         transform=transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((224,224)),
             transforms.ToTensor(),
-            #AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
-            #IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+            AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
+            IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+            
         ])
     )
 
@@ -758,8 +763,8 @@ def main():
         transforms.Resize((224,224)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        #AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
-        #IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+        AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
+        IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
         transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
     # No augumentation, only Normalize for testing
@@ -767,8 +772,8 @@ def main():
         transforms.ToPILImage(),
         transforms.Resize((224,224)),
         transforms.ToTensor(),
-        #AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
-        #IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
+        AutomaticBrightnessAndContrast(clip_hist_percent=clip_hist_percent),
+        IntensityClamp(percentile_low=percentile_low, percentile_high=percentile_high),
         transforms.Normalize(mean=mri_mean, std=mri_std)
     ])
 
@@ -885,4 +890,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
