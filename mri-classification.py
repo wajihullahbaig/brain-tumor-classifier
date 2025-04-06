@@ -522,7 +522,7 @@ class MoE(nn.Module):
     """Improved Mixture of Experts with enhanced components and regularization"""
     def __init__(self, num_experts=4, expert_hidden_dim=256, temp=0.1, num_classes=4):
         super().__init__()
-        # Backbone with ImageNet normalization
+        # Backbone 
         self.backbone = timm.create_model(
             'swin_base_patch4_window7_224',
             pretrained=True,
@@ -534,17 +534,12 @@ class MoE(nn.Module):
         dummy = torch.randn(2, 3, 224, 224)
         features = self.backbone(dummy)
         self.feature_dim = features[0].shape[1]
-        
-        # Enhanced gating network
-        self.gate = Gate(self.feature_dim, num_experts, temp)
-        
-        # Enhanced experts
+        self.gate = Gate(self.feature_dim, num_experts, temp)        
         self.experts = nn.ModuleList([
             Expert(self.feature_dim, expert_hidden_dim)
             for _ in range(num_experts)
         ])
         
-        # Enhanced classifier
         self.classifier = nn.Sequential(
             nn.Conv2d(self.feature_dim, self.feature_dim, 3, padding=1),
             nn.BatchNorm2d(self.feature_dim),
@@ -561,7 +556,6 @@ class MoE(nn.Module):
     def forward(self, x, labels=None, n_classes=None, return_losses=False):
         features = self.backbone(x)[0]
         
-        # Get expert weights
         expert_weights = self.gate(features, self.training)
         
         # Process through experts
@@ -650,12 +644,9 @@ def train_epoch(model, loader, optimizer, scheduler, num_classes,class_weights, 
         inputs, targets = inputs.to(device), targets.to(device)
         
         optimizer.zero_grad()
-        outputs, aux_losses = model(inputs, targets, num_classes, return_losses=True)
-        
-        # Focal loss with label smoothing - Good for imbalanced classes.
+        outputs, aux_losses = model(inputs, targets, num_classes, return_losses=True)        
         task_loss = main_loss(outputs, targets)
         
-        # Combine losses
         loss = task_loss + aux_losses['balance_loss'] + aux_losses['specialization_loss']
         
         loss.backward()
@@ -860,10 +851,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    # Create a dataset without normalization first
-    clip_hist_percent = 2
-    percentile_low = 5
-    percentile_high = 95
+    # Create a dataset for mean  and std calculation
+    # This dataset is not used for training or testing, just for normalization params
     temp_dataset = MRI_Dataset(
         root_dir=R'C:\Users\Precision\Onus\Data\Brain-MRIs\Training', 
         transform=transforms.Compose([
